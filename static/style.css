@@ -109,6 +109,11 @@ input[type="checkbox"] { accent-color: #2f6df6; }
 .entry-line.first { border-left: 3px solid #ff4d6d; }
 .error-line { font-size: 11px; color: #ffb36b; padding: 3px 6px; margin-top: 4px;
   background: rgba(255,179,107,.08); border-radius: 5px; }
+.link-btn {
+  background: none; border: none; color: #6ea8ff; cursor: pointer;
+  font-size: 11px; text-decoration: underline; padding: 0;
+}
+.link-btn:hover { color: #93c0ff; }
 
 .version-item {
   display: flex; align-items: center; gap: 6px; font-size: 12px;

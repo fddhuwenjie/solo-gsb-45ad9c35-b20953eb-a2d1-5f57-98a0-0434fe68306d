@@ -16,15 +16,52 @@ let analyzeTimer = null, saveTimer = null;
 let panelDirty = true;
 let workspaceRev = 0;      // 当前工作区修订号（GET 响应头 / PUT 响应体维护）
 let currentRelease = null; // 当前发布（GET /api/release）
+// 发布状态机：loading=尚未读到发布状态（页面可编辑但禁止一切工作区写请求）；
+// published=确认已有发布（禁飞区只存草稿、航线条件保存）；
+// none=确认从无发布（沿用原无条件自动保存）；error=读取失败（保留编辑、
+// 提示刷新，绝不能当作 none 处理）
+let releaseState = "loading";
+// 发布状态就绪承诺：所有工作区写请求（自动保存/核准/发布/载入版本）都先等它。
+// resolve 值为 releaseState；refreshRelease 可在用户点“重试/刷新”后重置
+let releaseReady = null;
+let resolveReleaseReady = null;
 let savedNfzs = [];        // 工作区已落库的禁飞区（已有发布时，页面的禁飞区编辑只存草稿）
 let serverRouteSeen = null; // 本页最近一次确认的“服务器航线”（编辑前所见基线）
 let routeConflict = null;   // 双方都改航线时的未解决冲突；非空期间暂停自动保存
+// 发布状态读取失败期间被挡下的防抖保存：编辑仍在页面。重试读到明确状态后
+// 据此补一次防抖保存（loading 期间的保存会在就绪承诺放行后自行发出，无需补）
+let writesWithheld = false;
 
 // 409 分流后确认“双方都改了航线”：保存中止并抛出本哨兵，
 // 调用方据此知道冲突面板已展示、不得把它当作保存成功继续核准/发布
 class RouteConflictError extends Error {
   constructor() { super("route conflict"); this.name = "RouteConflictError"; }
 }
+
+// 发布状态未明确（仍在读取或读取失败）：不得发起工作区写请求，
+// 调用方据此静默跳过自动保存，或提示用户刷新后再试核准/发布
+class ReleaseUnavailableError extends Error {
+  constructor(msg) { super(msg || "release status unavailable"); this.name = "ReleaseUnavailableError"; }
+}
+
+// 重置/生成“发布状态就绪”承诺：初始与用户点刷新时各调用一次
+function resetReleaseReady() {
+  releaseReady = new Promise((resolve) => { resolveReleaseReady = resolve; });
+}
+// 等待发布状态明确；明确前调用方不得发起任何工作区写请求。
+// 读取失败时 reject（不得当作“从无发布”）；重试成功后该承诺会随新承诺放行。
+// 其余返回 published / none
+async function waitReleaseReady() {
+  const s = await releaseReady;
+  if (s !== "published" && s !== "none") {
+    throw new ReleaseUnavailableError(s === "error"
+      ? "发布状态读取失败，请刷新页面后重试" : "发布状态尚未确认");
+  }
+  return s;
+}
+// 任何被挡下的防抖保存都记账：状态由 error 恢复明确后统一补发一次
+function noteWithheldWrite() { writesWithheld = true; }
+resetReleaseReady();
 
 // ----------------------------------------------------------- 工具
 const $ = (sel) => document.querySelector(sel);
@@ -112,6 +149,9 @@ function flushPendingSave() {
   // 立即落库，使随后的核准携带最新修订号；没有待发保存时绝不额外发起 PUT
   // （核准不预存工作区），只排入队尾等在途请求完成——若在途保存落为未解决
   // 的航线冲突（routeConflict 被置位），则把冲突向上传播，中止相邻核准/发布
+  //
+  // 前提：发布状态必须已明确——发布状态未读取/读取失败时不发起任何工作区
+  // 写请求（调用方会先 await waitReleaseReady 并提示刷新）。
   if (saveTimer !== null) {
     clearTimeout(saveTimer);
     saveTimer = null;
@@ -144,11 +184,58 @@ function presentRouteConflict(remoteState, remoteRev) {
   renderRouteConflict();
 }
 
+// 发布状态确认后，若 GET /api/state 与 GET /api/release 两次读取之间工作区
+// 修订号已变，不得把新修订号配旧航线写回。取回最新工作区，按已有分流口径
+// 处理：合入他页已核准禁飞区（本页有草稿则只换基线、草稿不落库）；
+// 服务器航线未变 → 只更新所见基线与修订号；双方航线都变 → 走现有航线冲突
+// 流程（暂停自动保存、并列双方航线供选择，草稿保留）。
+// 返回 true 表示已无分歧可继续条件保存；false 表示已走冲突分流，必须中止。
+async function reconcileWorkspaceRevIfPublished(seenRev) {
+  if (releaseState !== "published") return true;
+  if (workspaceRev === seenRev) return true;
+  let fresh, freshState;
+  try {
+    fresh = await fetch("/api/state");
+    freshState = await fresh.json();
+  } catch (e) {
+    // 取不回最新工作区时不阻断：workspaceRev 已采用 /api/release 的权威值，
+    // 后续航线条件保存若仍过时，会由 PUT 的 409 三分流安全处理，
+    // 绝不在此用“新修订号 + 旧航线”直接写回
+    return true;
+  }
+  const freshRev = parseInt(fresh.headers.get("X-Workspace-Rev") || "0", 10) || workspaceRev;
+  const remoteRoute = freshState.route || {};
+  // 任何情况下先合入他页已核准禁飞区（草稿保留在画布，绝不落库）
+  adoptServerNfzs(freshState.nfzs || []);
+  if (sameJson(remoteRoute, serverRouteSeen)) {
+    // 只有禁飞区在他页获核准（或同样的航线被重写）：采用最新修订号，
+    // 本页航线随后按所见最新修订号条件保存即可
+    workspaceRev = freshRev;
+    if (sameJson(state.route, serverRouteSeen)) state.route = clone(remoteRoute);
+    serverRouteSeen = clone(remoteRoute);
+    renderPanel(); renderBoard(); runAnalyze(); renderNfzDraft();
+    return true;
+  }
+  // 双方航线都变：沿现有冲突选择流程，保留本页航线与禁飞区草稿
+  presentRouteConflict(freshState, freshRev);
+  toast("航线在他页也被修改：已暂停自动保存，请选择处理方式");
+  renderPanel(); renderBoard(); runAnalyze(); renderNfzDraft();
+  return false;
+}
+
 async function doSaveState() {
+  // 发布状态未明确（读取中/读取失败）时绝不写工作区：
+  // 读取中由 scheduleSave 在定时器回调里等待；走到这里仍未明确则直接中止，
+  // 绝不能因为 currentRelease===null 就误走未发布的无条件 PUT 分支
+  if (releaseState !== "published" && releaseState !== "none") {
+    throw new ReleaseUnavailableError();
+  }
+  if (routeConflict) throw new RouteConflictError();
   // 已有发布时：航线编辑仍自动保存，但禁飞区变更只存草稿，
   // 落库的禁飞区必须是已核准的 savedNfzs，不得顺带写入草稿内容；
   // 并携带所见修订号：他页已变更（如别处刚核准）时不得静默覆盖
-  if (!currentRelease) {
+  if (releaseState !== "published") {
+    // 确认从无发布：沿用原无条件自动保存（不携带条件头）
     const payload = state;
     const res = await apiRaw("/api/state", {
       method: "PUT",
@@ -245,6 +332,8 @@ async function doSaveState() {
 async function saveStateNow() {
   clearTimeout(saveTimer);
   saveTimer = null;
+  // 发布状态明确前不发工作区写请求；读取失败向上抛出，由调用方提示刷新
+  await waitReleaseReady();
   // FIFO 队列保证不会与在途保存并发：后一个始终拿到前一个返回的修订号
   return enqueue(() => doSaveState());
 }
@@ -255,10 +344,21 @@ function scheduleSave() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    enqueue(() => doSaveState().catch((e) => {
-      if (e instanceof RouteConflictError) return; // 冲突面板已提示，不再弹保存失败
-      toast(e.message || "自动保存失败");
-    }));
+    // 发布状态可能尚未返回：保留页面编辑（state 不动），等状态明确后再决定
+    // 走未发布无条件保存还是已发布条件保存；读取失败则放弃本次写请求，
+    // 编辑仍在页面上，绝不把“读不到发布状态”当作“从无发布”
+    waitReleaseReady().then(
+      () => enqueue(() => doSaveState().catch((e) => {
+        if (e instanceof RouteConflictError) return; // 冲突面板已提示，不再弹保存失败
+        if (e instanceof ReleaseUnavailableError) return; // 已通过就绪门，理论上不会到这
+        toast(e.message || "自动保存失败");
+      })),
+      () => {
+        // 发布状态读取失败：保留编辑，不写工作区；侧栏提示刷新，
+        // 重试读到明确状态后由 replayWithheldWrite 统一补发
+        noteWithheldWrite();
+      }
+    );
   }, 500);
 }
 function scheduleAnalyze() {
@@ -785,22 +885,91 @@ $("#btnAddNfz").onclick = () => {
 const esc = (s) => String(s).replace(/[&<>"']/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+// 发布状态读取：与 GET /api/state 之间工作区修订号可能已被他页推进。
+// 读取失败与“确认从无发布”必须区分：失败时保留编辑、侧栏提示刷新，
+// 绝不能当作未发布而放行无条件 PUT。
 async function loadRelease() {
+  let r = null;
   try {
-    const r = await api("/api/release");
-    if (r && r.ok) {
-      currentRelease = r.release;
-      if (typeof r.workspaceRev === "number") workspaceRev = r.workspaceRev;
+    r = await api("/api/release");
+  } catch (e) {
+    r = null;
+  }
+  if (!r || !r.ok) {
+    releaseState = "error";
+    resolveReleaseReady(releaseState);
+    renderRelease();
+    renderNfzDraft();
+    return;
+  }
+  const seenRev = workspaceRev; // GET /api/state 读到的修订号
+  if (r.release) {
+    releaseState = "published";
+    currentRelease = r.release;
+    if (typeof r.workspaceRev === "number") workspaceRev = r.workspaceRev;
+    renderRelease();
+    // 两次读取之间修订号已变：先取回最新工作区（合入他页已核准禁飞区；
+    // 双方航线都变则走冲突选择流程并暂停自动保存），完成后再放行写请求门，
+    // 避免“新修订号 + 编辑前所见旧航线”被立刻条件写回
+    let conflicted = false;
+    if (typeof r.workspaceRev === "number") {
+      conflicted = !(await reconcileWorkspaceRevIfPublished(seenRev));
     }
-  } catch (e) { /* 保持现状 */ }
+    resolveReleaseReady(releaseState);
+    renderNfzDraft();
+    replayWithheldWrite(conflicted);
+  } else {
+    releaseState = "none";
+    currentRelease = null;
+    if (typeof r.workspaceRev === "number") workspaceRev = r.workspaceRev;
+    resolveReleaseReady(releaseState);
+    renderRelease();
+    renderNfzDraft();
+    replayWithheldWrite(false);
+  }
+}
+
+// error 期间被挡下的防抖保存：状态恢复明确后若仍有未保存编辑，补发一次。
+// 航线冲突已分流时（自动保存已暂停）不补发，沿用冲突选择流程；禁飞区草稿
+// 本就不落库，发布明确后由草稿面板继续提示核准。
+function replayWithheldWrite(conflicted) {
+  if (!writesWithheld) return;
+  writesWithheld = false;
+  if (conflicted || routeConflict) return;
+  const routeDirty = !sameJson(state.route, serverRouteSeen);
+  if (releaseState === "none") {
+    const anythingDirty = routeDirty || !sameJson(state.nfzs, savedNfzs);
+    if (anythingDirty) scheduleSave();
+  } else if (releaseState === "published" && routeDirty) {
+    scheduleSave();
+  }
+}
+
+// 用户在读取失败提示上点“重试/刷新”：重新读取前先复位就绪承诺，
+// 期间一切工作区写请求继续被挡住，直到再次明确（成功或仍失败）
+function refreshRelease() {
+  if (releaseState !== "error") return loadRelease();
+  releaseState = "loading";
+  resetReleaseReady();
   renderRelease();
   renderNfzDraft();
+  return loadRelease();
 }
 
 // err 非空时在发布卡片上方展示最近一次发布失败的原因与明细
 function renderRelease(err) {
   const box = $("#releaseBox");
   let html = "";
+  if (releaseState === "loading") {
+    box.innerHTML = `<div class="summary">正在确认发布状态…（发布状态明确前暂不自动保存工作区，编辑仍保留在本页）</div>`;
+    return;
+  }
+  if (releaseState === "error") {
+    box.innerHTML = `<div class="error-line">⚠ 发布状态读取失败：本页编辑已保留，但在确认发布状态前不会保存工作区，请刷新页面或<button id="btnReleaseRetry" class="link-btn">重试</button>。</div>`;
+    const btn = $("#btnReleaseRetry");
+    if (btn) btn.onclick = () => refreshRelease();
+    return;
+  }
   if (err) {
     html += `<div class="error-line">⚠ 发布失败：${esc(err.error || "未知原因")}</div>`;
     for (const e of err.errors || []) {
@@ -840,8 +1009,13 @@ async function publishVersion(v) {
     return;
   }
   try {
+    await waitReleaseReady();
     await flushPendingSave();
   } catch (e) {
+    if (e instanceof ReleaseUnavailableError) {
+      toast("发布状态尚未确认或读取失败，请刷新页面后重试，未继续发布");
+      return;
+    }
     if (e instanceof RouteConflictError) {
       toast("航线自动保存与他页冲突，已暂停，请先选择处理方式，未继续发布");
       return;
@@ -866,6 +1040,7 @@ async function publishVersion(v) {
     }
     if (r.ok) {
       currentRelease = r.release;
+      releaseState = "published";
       renderRelease();
       renderNfzDraft(); // 进入“已有发布”状态：此后的禁飞区变更先存草稿
       toast(`已发布 #${r.release.seq}（来源：${r.release.sourceVersionName}）`);
@@ -876,6 +1051,7 @@ async function publishVersion(v) {
           const cur = await api("/api/release");
           if (cur && cur.ok) {
             currentRelease = cur.release;
+            releaseState = cur.release ? "published" : "none";
             if (typeof cur.workspaceRev === "number") workspaceRev = cur.workspaceRev;
           }
         } catch (e) { /* 忽略 */ }
@@ -890,8 +1066,10 @@ async function publishVersion(v) {
 // 已有发布时，禁飞区的增删/拖动/修改（含载入版本带来的变化）只存为页面草稿，
 // 提交核准通过后才替换工作区禁飞区；尚未发布时沿用原自动保存。
 function saveOrDraftNfz() {
-  if (currentRelease) renderNfzDraft(); // 留作草稿，不落库
-  else scheduleSave();
+  if (releaseState === "published") renderNfzDraft(); // 留作草稿，不落库
+  else if (releaseState === "none") scheduleSave();
+  // loading / error：发布状态未明确，编辑只保留在页面，不发工作区写请求；
+  // 状态确认后（loadRelease 的合流/冲突分流）再决定草稿去留，绝不按未发布处理
 }
 function nfzDraftDirty() {
   return !!currentRelease && JSON.stringify(state.nfzs) !== JSON.stringify(savedNfzs);
@@ -949,8 +1127,13 @@ async function submitNfzApproval() {
     return;
   }
   try {
+    await waitReleaseReady();
     await flushPendingSave();
   } catch (e) {
+    if (e instanceof ReleaseUnavailableError) {
+      toast("发布状态尚未确认或读取失败，请刷新页面后重试，未继续核准");
+      return;
+    }
     if (e instanceof RouteConflictError) {
       toast("航线自动保存与他页冲突，已暂停，请先选择处理方式，未继续核准");
       return;
@@ -991,7 +1174,10 @@ async function doNfzApproval() {
       serverRouteSeen = clone(fresh.route || serverRouteSeen);
       // 已核准基线以服务器为准：本页无草稿时画布一并采用，有草稿则只换基线、草稿不覆盖
       adoptServerNfzs(fresh.nfzs || []);
-      if (relRes && relRes.ok) currentRelease = relRes.release;
+      if (relRes && relRes.ok) {
+        currentRelease = relRes.release;
+        releaseState = relRes.release ? "published" : "none";
+      }
     } catch (e) { /* 仍展示下方失败明细 */ }
     renderRelease();
   }
@@ -1028,6 +1214,11 @@ async function loadVersions() {
       try {
         await saveStateNow(); // 已有发布时仅落库航线，版本带来的禁飞区变化留作草稿
       } catch (e) {
+        if (e instanceof ReleaseUnavailableError) {
+          renderPanel(); fitView(); runAnalyze();
+          toast("发布状态尚未确认或读取失败：版本已载入但未保存，请刷新页面后重试");
+          return;
+        }
         if (e instanceof RouteConflictError) {
           renderPanel(); fitView(); runAnalyze();
           toast("载入的航线与他页已保存航线冲突，已暂停自动保存，请选择加载或确认提交");
@@ -1059,7 +1250,10 @@ $("#btnSaveVer").onclick = async () => {
   await loadState();
   renderPanel();
   fitView();
+  // 发布状态未返回期间页面已可编辑，但所有工作区写请求都经 releaseReady
+  // 门控等待，先在发布卡片处显示“确认中”，绝不显示成“暂无发布”
+  renderRelease();
   loadVersions();
-  loadRelease();
+  loadRelease(); // 不阻塞渲染：其返回前自动保存/核准/发布一律等待，不误写工作区
   runAnalyze();
 })();
